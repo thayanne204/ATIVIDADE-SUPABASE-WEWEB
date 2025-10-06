@@ -1,0 +1,224 @@
+
+-- Extensions
+CREATE EXTENSION IF NOT EXISTS "pgcrypto"; -- fornece gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ======================
+-- TABELAS
+-- ======================
+
+-- users (organizadores e participantes)
+CREATE TABLE IF NOT EXISTS users (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  email text NOT NULL UNIQUE,
+  role text NOT NULL DEFAULT 'attendee', -- 'organizer' | 'attendee'
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- categories (categorias de evento)
+CREATE TABLE IF NOT EXISTS categories (
+  id serial PRIMARY KEY,
+  name text NOT NULL UNIQUE
+);
+
+-- venues (locais)
+CREATE TABLE IF NOT EXISTS venues (
+  id serial PRIMARY KEY,
+  name text NOT NULL,
+  address text,
+  city text,
+  capacity integer
+);
+
+-- events (eventos)
+CREATE TABLE IF NOT EXISTS events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  title text NOT NULL,
+  description text,
+  category_id integer NOT NULL REFERENCES categories(id) ON DELETE RESTRICT,
+  venue_id integer REFERENCES venues(id) ON DELETE SET NULL,
+  organizer_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  start_datetime timestamptz NOT NULL,
+  end_datetime timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  published boolean NOT NULL DEFAULT false
+);
+
+-- tickets (tipos de ingresso por evento)
+CREATE TABLE IF NOT EXISTS tickets (
+  id serial PRIMARY KEY,
+  event_id uuid NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+  name text NOT NULL, -- ex: 'Pista', 'VIP'
+  price numeric(10,2) NOT NULL DEFAULT 0,
+  quantity_total integer NOT NULL DEFAULT 0,
+  quantity_sold integer NOT NULL DEFAULT 0
+);
+
+-- registrations (compra/registro de ingressos por usuário)
+CREATE TABLE IF NOT EXISTS registrations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ticket_id integer NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  quantity integer NOT NULL CHECK (quantity > 0),
+  total_price numeric(10,2) NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- ======================
+-- FUNÇÕES & TRIGGERS
+-- Mantém tickets.quantity_sold consistente quando registrations são inseridas/atualizadas/deletadas
+-- ======================
+
+-- Função para incrementar quantidade vendida
+CREATE OR REPLACE FUNCTION fn_registrations_increment()
+RETURNS TRIGGER AS $$
+BEGIN
+  UPDATE tickets
+  SET quantity_sold = quantity_sold + NEW.quantity
+  WHERE id = NEW.ticket_id;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Função para decrementar quantidade vendida (após delete)
+CREATE OR REPLACE FUNCTION fn_registrations_decrement()
+RETURNS TRIGGER AS $$
+BEGIN
+  UPDATE tickets
+  SET quantity_sold = quantity_sold - OLD.quantity
+  WHERE id = OLD.ticket_id;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Função para ajustar quantidade vendida no UPDATE (quando ticket_id ou quantity mudam)
+CREATE OR REPLACE FUNCTION fn_registrations_update_adjust()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- If ticket id hasn't changed, adjust by the delta
+  IF NEW.ticket_id = OLD.ticket_id THEN
+    UPDATE tickets
+    SET quantity_sold = quantity_sold + (NEW.quantity - OLD.quantity)
+    WHERE id = NEW.ticket_id;
+  ELSE
+    -- ticket changed: subtract from old ticket, add to new ticket
+    UPDATE tickets
+    SET quantity_sold = quantity_sold - OLD.quantity
+    WHERE id = OLD.ticket_id;
+
+    UPDATE tickets
+    SET quantity_sold = quantity_sold + NEW.quantity
+    WHERE id = NEW.ticket_id;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Triggers
+DROP TRIGGER IF EXISTS trg_registrations_after_insert ON registrations;
+CREATE TRIGGER trg_registrations_after_insert
+AFTER INSERT ON registrations
+FOR EACH ROW
+EXECUTE FUNCTION fn_registrations_increment();
+
+DROP TRIGGER IF EXISTS trg_registrations_after_delete ON registrations;
+CREATE TRIGGER trg_registrations_after_delete
+AFTER DELETE ON registrations
+FOR EACH ROW
+EXECUTE FUNCTION fn_registrations_decrement();
+
+DROP TRIGGER IF EXISTS trg_registrations_after_update ON registrations;
+CREATE TRIGGER trg_registrations_after_update
+AFTER UPDATE ON registrations
+FOR EACH ROW
+EXECUTE FUNCTION fn_registrations_update_adjust();
+
+-- ======================
+-- VIEW: Eventos futuros publicados com totais de ingressos
+-- ======================
+CREATE OR REPLACE VIEW view_upcoming_events AS
+SELECT
+  e.id,
+  e.title,
+  e.description,
+  e.start_datetime,
+  e.end_datetime,
+  c.name AS category,
+  v.name AS venue,
+  v.city AS city,
+  COALESCE(SUM(t.quantity_total),0) AS total_tickets,
+  COALESCE(SUM(t.quantity_sold),0) AS sold_tickets,
+  COALESCE(SUM(t.quantity_total),0) - COALESCE(SUM(t.quantity_sold),0) AS tickets_available
+FROM events e
+LEFT JOIN categories c ON e.category_id = c.id
+LEFT JOIN venues v ON e.venue_id = v.id
+LEFT JOIN tickets t ON t.event_id = e.id
+WHERE e.start_datetime > now() AND e.published = true
+GROUP BY e.id, c.name, v.name, v.city, e.title, e.description, e.start_datetime, e.end_datetime;
+
+-- ======================
+-- FUNÇÃO: Resumo de vendas por evento
+-- ======================
+CREATE OR REPLACE FUNCTION get_event_sales(event_uuid uuid)
+RETURNS TABLE(
+  event_id uuid,
+  event_title text,
+  total_tickets integer,
+  sold_tickets integer,
+  total_revenue numeric
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    e.id,
+    e.title,
+    COALESCE(SUM(t.quantity_total),0) as total_tickets,
+    COALESCE(SUM(t.quantity_sold),0) as sold_tickets,
+    COALESCE(SUM(t.quantity_sold * t.price),0) as total_revenue
+  FROM events e
+  LEFT JOIN tickets t ON t.event_id = e.id
+  WHERE e.id = event_uuid
+  GROUP BY e.id, e.title;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ======================
+-- Dados de exemplo (seed) — opcionais para testes
+-- ======================
+
+-- categories seed
+INSERT INTO categories (name) VALUES
+('Música') ON CONFLICT DO NOTHING,
+('Tecnologia') ON CONFLICT DO NOTHING,
+('Artes') ON CONFLICT DO NOTHING,
+('Palestras') ON CONFLICT DO NOTHING;
+
+-- venues seed
+INSERT INTO venues (name, address, city, capacity) VALUES
+('Teatro Central', 'Av. Exemplo, 100', 'Teresina', 800) ON CONFLICT DO NOTHING,
+('Auditório Campus', 'Rua X, 50', 'Teresina', 200) ON CONFLICT DO NOTHING;
+
+-- users seed (organizador e participante)
+INSERT INTO users (id, name, email, role) VALUES
+(gen_random_uuid(), 'Thayanne Oliveira', 'oliveirathayanne438@gmail.com','organizer') ON CONFLICT DO NOTHING,
+(gen_random_uuid(), 'João Silva', 'joao@example.com','attendee') ON CONFLICT DO NOTHING;
+
+-- Um evento de exemplo (somente se não existir um com o mesmo título)
+INSERT INTO events (id, title, description, category_id, venue_id, organizer_id, start_datetime, end_datetime, published)
+SELECT gen_random_uuid(), 'Festival de Tecnologia 2025', 'Um dia com palestras e workshops sobre desenvolvimento', c.id, v.id, u.id, now() + interval '15 days', now() + interval '15 days' + interval '8 hours', true
+FROM (SELECT id FROM categories WHERE name='Tecnologia' LIMIT 1) c,
+     (SELECT id FROM venues WHERE name='Auditório Campus' LIMIT 1) v,
+     (SELECT id FROM users WHERE email='oliveirathayanne438@gmail.com' LIMIT 1) u
+WHERE NOT EXISTS (
+  SELECT 1 FROM events e WHERE e.title = 'Festival de Tecnologia 2025'
+)
+LIMIT 1;
+
+-- Tickets de exemplo (se existir o evento criado acima)
+INSERT INTO tickets (event_id, name, price, quantity_total)
+SELECT e.id, 'Pista', 50.00, 150 FROM events e WHERE e.title = 'Festival de Tecnologia 2025' AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.event_id = e.id AND t.name='Pista');
+INSERT INTO tickets (event_id, name, price, quantity_total)
+SELECT e.id, 'VIP', 120.00, 50 FROM events e WHERE e.title = 'Festival de Tecnologia 2025' AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.event_id = e.id AND t.name='VIP');
+
+COMMIT;
